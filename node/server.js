@@ -7,23 +7,31 @@ const path = require('path');
 const cors = require('cors');
 const passport = require('passport');
 const session = require('express-session');
-const { ObjectID } = require('mongodb');
-const LocalStrategy = require('passport-local');
+const MongoStore = require('connect-mongo')(session);
+const cookieParser = require('cookie-parser');
+const passportSocketIo = require('passport.socketio');
+const http = require('http');
+const io = require('socket.io');
 
 const app = express();
 
-// Configuración CORS ultra permisiva para pruebas de freeCodeCamp
+// Configuración CORS simple y permisiva para desarrollo y pruebas
 app.use(cors({
-  origin: '*',
+  origin: true, // Permitir todas las origins durante desarrollo
+  credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['*']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Cache-Control']
 }));
 
-// Headers CORS adicionales
+// Headers CORS adicionales para solicitudes OPTIONS
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = req.get('origin');
+
+  // Configuración permisiva para desarrollo
+  res.header('Access-Control-Allow-Origin', origin || '*');
+  res.header('Access-Control-Allow-Credentials', 'true');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Cache-Control');
 
   if (req.method === 'OPTIONS') {
     res.status(200).end();
@@ -38,12 +46,18 @@ app.use('/public', express.static(process.cwd() + '/public'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Configuración de sesión
+// Configuración de sesión con MongoStore
+const URI = process.env.MONGO_URI;
+const store = new MongoStore({ url: URI });
+
+app.use(cookieParser());
 app.use(session({
   secret: process.env.SESSION_SECRET || 'default-secret',
   resave: true,
   saveUninitialized: true,
-  cookie: { secure: false }
+  cookie: { secure: false },
+  key: 'express.sid',
+  store: store
 }));
 
 // Inicializar Passport
@@ -54,134 +68,76 @@ app.use(passport.session());
 myDB(async (client) => {
   const myDataBase = await client.db('database').collection('users');
 
-  // Configurar serialización y deserialización con base de datos
-  passport.serializeUser((user, done) => {
-    done(null, user._id);
-  });
+  // Initialize authentication and routes modules
+  require('./auth.js')(app, myDataBase);
+  require('./routes.js')(app, myDataBase);
 
-  passport.deserializeUser((id, done) => {
-    myDataBase.findOne({ _id: new ObjectID(id) }, (err, doc) => {
-      if (err) {
-        console.error('Database error:', err);
-        return done(err);
-      }
-      done(null, doc);
-    });
-  });
+  // Create HTTP server and Socket.IO
+  const httpServer = http.createServer(app);
+  const io = require('socket.io')(httpServer);
 
-  // Configurar estrategia de autenticación local
-  passport.use(new LocalStrategy((username, password, done) => {
-    myDataBase.findOne({ username: username }, (err, user) => {
-      console.log(`User ${username} attempted to log in.`);
-      if (err) return done(err);
-      if (!user) return done(null, false);
-      if (password !== user.password) return done(null, false);
-      return done(null, user);
-    });
-  }));
+  // Socket.IO authorization with Passport
+  io.use(
+    passportSocketIo.authorize({
+      cookieParser: cookieParser,
+      key: 'express.sid',
+      secret: process.env.SESSION_SECRET,
+      store: store,
+      success: onAuthorizeSuccess,
+      fail: onAuthorizeFail
+    })
+  );
 
-  // Función middleware para verificar autenticación
-  function ensureAuthenticated(req, res, next) {
-    if (req.isAuthenticated()) {
-      return next();
-    }
-    res.redirect('/');
+  // Socket.IO authorization callbacks
+  function onAuthorizeSuccess(data, accept) {
+    console.log('successful connection to socket.io');
+    accept(null, true);
   }
-  
-  // Configuración de Pug
-  app.set('view engine', 'pug');
-  app.set('views', './views/pug');
 
-  // Ruta principal
-  app.route('/').get((req, res) => {
-    res.render('index', {
-      title: 'Connected to Database',
-      message: 'Please login',
-      showLogin: true,
-      showRegistration: true
-    });
-  });
+  function onAuthorizeFail(data, message, error, accept) {
+    if (error) throw new Error(message);
+    console.log('failed connection to socket.io:', message);
+    accept(null, false);
+  }
 
-  // Ruta de registro POST
-  app.route('/register')
-    .post((req, res, next) => {
-      myDataBase.findOne({ username: req.body.username }, (err, user) => {
-        if (err) {
-          next(err);
-        } else if (user) {
-          res.redirect('/');
-        } else {
-          myDataBase.insertOne({
-            username: req.body.username,
-            password: req.body.password
-          },
-            (err, doc) => {
-              if (err) {
-                res.redirect('/');
-              } else {
-                // The inserted document is held within
-                // the ops property of the doc
-                next(null, doc.ops[0]);
-              }
-            }
-          )
-        }
-      })
-    },
-      passport.authenticate('local', { failureRedirect: '/' }),
-      (req, res, next) => {
-        res.redirect('/profile');
-      }
-    );
-  
-  // Ruta de login POST
-  app.post('/login', passport.authenticate('local', { failureRedirect: '/' }), (req, res) => {
-    res.redirect('/profile');
-  });
-  
-  // Ruta del perfil con protección de autenticación
-  app.get('/profile', ensureAuthenticated, (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.render('profile', {
-      username: req.user.username
+  // Socket.IO connection handling
+  let currentUsers = 0;
+
+  io.on('connection', socket => {
+    console.log('user ' + socket.request.user.username + ' connected');
+    ++currentUsers;
+    io.emit('user', {
+      username: socket.request.user.username,
+      currentUsers,
+      connected: true
     });
-  });
-  
-  // Ruta de logout
-  app.route('/logout')
-    .get((req, res) => {
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Credentials', 'true');
-      req.logout((err) => {
-        if (err) {
-          console.error('Logout error:', err);
-        }
-        res.redirect('/');
+
+    // Handle chat messages
+    socket.on('chat message', (message) => {
+      io.emit('chat message', {
+        username: socket.request.user.username,
+        message: message
       });
     });
-  
-  // Rutas para pruebas de freeCodeCamp
-  app.get('/api/package.json', (req, res) => {
-    res.json(require('./package.json'));
-  });
-  
-  app.get('/api/server.js', (req, res) => {
-    res.type('application/javascript').send(require('fs').readFileSync(__filename, 'utf8'));
-  });
 
-  // Middleware para manejar páginas no encontradas (404)
-  app.use((req, res, next) => {
-    res.status(404)
-      .type('text')
-      .send('Not Found');
+    // Handle user disconnection
+    socket.on('disconnect', () => {
+      console.log('user ' + socket.request.user.username + ' disconnected');
+      --currentUsers;
+      io.emit('user', {
+        username: socket.request.user.username,
+        currentUsers,
+        connected: false
+      });
+    });
   });
   
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
+  httpServer.listen(PORT, () => {
     console.log('✅ Server running on port', PORT);
     console.log('✅ Connected to MongoDB Atlas');
     console.log('✅ Passport serialization configured');
+    console.log('✅ Socket.IO server initialized');
   });
 
 }).catch(e => {
@@ -200,7 +156,7 @@ myDB(async (client) => {
   });
 
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
+  httpServer.listen(PORT, () => {
     console.log('⚠️ Server running on port', PORT, '(Database unavailable)');
   });
 });
